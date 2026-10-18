@@ -1,86 +1,45 @@
 import os
 import sys
+import uuid
 import tempfile
-import pathlib
+import asyncio
+from pathlib import Path
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from fastapi.testclient import TestClient
 
-# Ensure root directory is on python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# Configure disposable test database path
+temp_dir = Path(tempfile.gettempdir())
+test_db_filename = f"opspilot_test_{uuid.uuid4().hex[:8]}.db"
+test_db_path = temp_dir / test_db_filename
 
-from backend.app.core.database import Base, get_db
-from backend.app.main import app
-from backend.scripts.seed import seed_database
-import embedded_postgres
+# If DATABASE_URL is unset, points to default dev db, or explicitly requested for test isolation:
+dev_db_match = "opspilot.db" in os.environ.get("DATABASE_URL", "")
+if "DATABASE_URL" not in os.environ or dev_db_match:
+    os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{test_db_path.as_posix()}"
 
-_pg_server = None
-_test_db_url = None
+from app.core.config import settings
+# Ensure settings also reflects the test database URL
+settings.DATABASE_URL = os.environ["DATABASE_URL"]
 
+from app.core.database import engine, Base, AsyncSessionLocal
+from app.scripts.seed import seed_data
 
-@pytest.fixture(scope="session")
-def postgres_engine():
-    global _pg_server, _test_db_url
-    temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="newtonite_pg_"))
-    _pg_server = embedded_postgres.PostgresServer(temp_dir)
-    raw_uri = _pg_server.get_uri() # e.g. postgresql://postgres:@127.0.0.1:port/postgres
-    # Convert uri to use psycopg driver
-    _test_db_url = raw_uri.replace("postgresql://", "postgresql+psycopg://")
-    
-    engine = create_engine(_test_db_url, pool_pre_ping=True)
-    Base.metadata.create_all(bind=engine)
-    
-    yield engine
-    
-    engine.dispose()
-    if _pg_server:
+@pytest.fixture(scope="session", autouse=True)
+def setup_test_database():
+    """
+    Session-level test fixture providing complete test isolation:
+    1. Initializes schema and seeds test data on a disposable database.
+    2. Runs all tests safely without touching or modifying the developer database.
+    3. Safely disposes connections and unlinks the temporary database on teardown.
+    """
+    # 1. Initialize schema and seed data
+    asyncio.run(seed_data(item_count=1000))
+
+    yield
+
+    # 2. Cleanup: dispose connections and remove temporary database
+    asyncio.run(engine.dispose())
+    if test_db_path.exists():
         try:
-            _pg_server.cleanup()
+            test_db_path.unlink()
         except Exception:
             pass
-
-
-@pytest.fixture(scope="function")
-def db_session(postgres_engine):
-    connection = postgres_engine.connect()
-    SessionTest = sessionmaker(autocommit=False, autoflush=False, bind=connection)
-    session = SessionTest()
-
-    # Seed fresh demo data
-    seed_database(session)
-
-    yield session
-
-    session.close()
-    # Clean tables after each test
-    with connection.begin():
-        for table in reversed(Base.metadata.sorted_tables):
-            connection.execute(table.delete())
-    connection.close()
-
-
-
-@pytest.fixture(scope="function")
-def client(db_session):
-    def override_get_db():
-        try:
-            yield db_session
-        finally:
-            pass
-
-    app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as test_client:
-        yield test_client
-    app.dependency_overrides.clear()
-
-
-@pytest.fixture
-def auth_headers(client):
-    """Helper function to obtain bearer token headers for seeded demo users."""
-    def _login(email: str, password: str = "Password123!"):
-        res = client.post("/auth/login", json={"email": email, "password": password})
-        assert res.status_code == 200, f"Login failed for {email}: {res.text}"
-        token = res.json()["access_token"]
-        return {"Authorization": f"Bearer {token}"}
-    return _login

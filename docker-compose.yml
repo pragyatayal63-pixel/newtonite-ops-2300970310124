@@ -1,38 +1,56 @@
 services:
   db:
     image: postgres:16-alpine
-    container_name: newtonite-postgres
+    container_name: opspilot-postgres
     restart: always
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: newtonite
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: opspilot_db
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - opspilot_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d newtonite"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d opspilot_db"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  backend:
+  app:
     build:
       context: .
-      dockerfile: Dockerfile.backend
-    container_name: newtonite-backend
-    restart: unless-stopped
+      dockerfile: Dockerfile
+    container_name: opspilot-app
+    restart: always
     environment:
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/newtonite
-      SECRET_KEY: docker_demo_super_secret_jwt_key_32chars_min!
-      ALGORITHM: HS256
-      ACCESS_TOKEN_EXPIRE_MINUTES: 480
+      DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@db:5432/opspilot_db
+      PORT: 8000
+      HOST: 0.0.0.0
+      SECRET_KEY: test-secret-key-production-ready-32-chars-long
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
 
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opspilot-worker
+    restart: always
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@db:5432/opspilot_db
+      SECRET_KEY: test-secret-key-production-ready-32-chars-long
+      OUTBOX_POLL_INTERVAL_SECONDS: 2
+      OUTBOX_MAX_RETRIES: 5
+    depends_on:
+      db:
+        condition: service_healthy
+      app:
+        condition: service_started
+
 volumes:
-  postgres_data:
+  opspilot_postgres_data:
